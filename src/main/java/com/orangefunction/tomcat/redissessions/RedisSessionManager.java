@@ -1,40 +1,45 @@
 package com.orangefunction.tomcat.redissessions;
 
-import org.apache.catalina.Lifecycle;
-import org.apache.catalina.LifecycleException;
-import org.apache.catalina.LifecycleListener;
-import org.apache.catalina.util.LifecycleSupport;
-import org.apache.catalina.LifecycleState;
-import org.apache.catalina.Loader;
-import org.apache.catalina.Valve;
-import org.apache.catalina.Session;
-import org.apache.catalina.session.ManagerBase;
-
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
-import org.apache.commons.pool2.impl.BaseObjectPoolConfig;
-
-import redis.clients.util.Pool;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisSentinelPool;
-import redis.clients.jedis.JedisPoolConfig;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.Protocol;
-
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.Set;
 import java.util.EnumSet;
+import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.Set;
 
+import javax.management.InstanceAlreadyExistsException;
+import javax.management.MBeanRegistrationException;
+import javax.management.MBeanServer;
+import javax.management.MalformedObjectNameException;
+import javax.management.NotCompliantMBeanException;
+import javax.management.ObjectName;
+
+import org.apache.catalina.Lifecycle;
+import org.apache.catalina.LifecycleException;
+import org.apache.catalina.LifecycleState;
+import org.apache.catalina.Loader;
+import org.apache.catalina.Session;
+import org.apache.catalina.session.StandardManager;
+import org.apache.catalina.session.StandardSession;
+import org.apache.catalina.util.LifecycleSupport;
+import org.apache.catalina.util.SessionIdGenerator;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
 
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.JedisSentinelPool;
+import redis.clients.jedis.Protocol;
+import redis.clients.util.Pool;
 
-public class RedisSessionManager extends ManagerBase implements Lifecycle {
 
+public class RedisSessionManager extends StandardManager implements RedisSessionManagerMBean {
+
+  //private static ExecutorService executorService = Executors.newCachedThreadPool();
+    
   enum SessionPersistPolicy {
     DEFAULT,
     SAVE_ON_CHANGE,
@@ -65,11 +70,6 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
   protected Pool<Jedis> connectionPool;
   protected JedisPoolConfig connectionPoolConfig = new JedisPoolConfig();
 
-  protected RedisSessionHandlerValve handlerValve;
-  protected ThreadLocal<RedisSession> currentSession = new ThreadLocal<>();
-  protected ThreadLocal<SessionSerializationMetadata> currentSessionSerializationMetadata = new ThreadLocal<>();
-  protected ThreadLocal<String> currentSessionId = new ThreadLocal<>();
-  protected ThreadLocal<Boolean> currentSessionIsPersisted = new ThreadLocal<>();
   protected Serializer serializer;
 
   protected static String name = "RedisSessionManager";
@@ -189,16 +189,7 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     this.sentinelMaster = master;
   }
 
-  @Override
-  public int getRejectedSessions() {
-    // Essentially do nothing.
-    return 0;
-  }
-
-  public void setRejectedSessions(int i) {
-    // Do nothing.
-  }
-
+  
   protected Jedis acquireConnection() {
     Jedis jedis = connectionPool.getResource();
 
@@ -221,46 +212,96 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     returnConnection(jedis, false);
   }
 
-  @Override
-  public void load() throws ClassNotFoundException, IOException {
-
+  
+  private void registerMean()
+  {
+      MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer(); 
+      try
+    {
+          RedisSessionManagerMBean sessionPipe = this;
+        mBeanServer.registerMBean(sessionPipe, new ObjectName("tomcat.Redis.plugin:name=ISessionPipe"));
+    } catch (InstanceAlreadyExistsException | MBeanRegistrationException | NotCompliantMBeanException | MalformedObjectNameException e)
+    {
+        // TODO Auto-generated catch block
+        e.printStackTrace();
+    } 
   }
+    /**
+     * Restore all sessions from redis database to tomcat web server
+     * 
+     * @throws IOException
+     */
+    public void restoreAllSessions() throws IOException
+    {
+        log.info("reloadAllSessions");
+        Jedis jedis = null;
+        try
+        {
+            log.trace("Attempting to load all session from Redis");
+            jedis = acquireConnection();
+            synchronized (this.sessions)
+            {
+                Set<String> sessionIdSet = jedis.keys("*");
+                this.log.info(sessionIdSet);
+                if (this.log.isDebugEnabled())
+                {
+                    this.log.debug("Loading " + sessionIdSet.size() + " persisted sessions");
+                }
+                for (String id : sessionIdSet)
+                {
+                    byte[] data = jedis.get(id.getBytes());
+                    if (data != null)
+                    {
+                        DeserializedSessionContainer container = sessionFromSerializedData(id, data);
+                        StandardSession session = toSession(container.session);
+                        if(this.sessions.containsKey(session.getIdInternal()))
+                        {
+                            continue;//If the tomcat web server contains current session, don't overwrite it.
+                        }
+                        this.sessions.put(session.getIdInternal(), session);
+                        session.activate();
+                        if (!session.isValid())
+                        {
+                            session.setValid(true);
+                            session.expire();
+                        }
+                        this.sessionCounter += 1L;
+                    }
+                }
+            }
+            if (this.log.isDebugEnabled())
+            {
+                this.log.debug("Finish: Loading persisted sessions");
+            }
+        } finally
+        {
+            if (jedis != null)
+            {
+                returnConnection(jedis, false);
+            }
+        }
+    }
 
-  @Override
-  public void unload() throws IOException {
-
-  }
-
-  /**
-   * Add a lifecycle event listener to this component.
-   *
-   * @param listener The listener to add
-   */
-  @Override
-  public void addLifecycleListener(LifecycleListener listener) {
-    lifecycle.addLifecycleListener(listener);
-  }
-
-  /**
-   * Get the lifecycle listeners associated with this lifecycle. If this
-   * Lifecycle has no listeners registered, a zero-length array is returned.
-   */
-  @Override
-  public LifecycleListener[] findLifecycleListeners() {
-    return lifecycle.findLifecycleListeners();
-  }
-
-
-  /**
-   * Remove a lifecycle event listener from this component.
-   *
-   * @param listener The listener to remove
-   */
-  @Override
-  public void removeLifecycleListener(LifecycleListener listener) {
-    lifecycle.removeLifecycleListener(listener);
-  }
-
+    /**
+     * Backup all sessions from tomcat web server to redis database 
+     * @throws IOException 
+     * 
+     */
+    public void backupAllSessions() throws IOException
+    {
+        for(Session session:sessions.values())
+        {
+            try
+            {
+                save(fromSession(session),true);
+            } catch (IOException ex)
+            {
+                log.warn("Unable to add to session manager store: " + ex.getMessage());
+                throw new IOException("Unable to add to session manager store.", ex);
+            }
+        }
+    }
+    
   /**
    * Start this component and implement the requirements
    * of {@link org.apache.catalina.util.LifecycleBase#startInternal()}.
@@ -270,27 +311,35 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
    */
   @Override
   protected synchronized void startInternal() throws LifecycleException {
-    super.startInternal();
-
+   /* super.startInternal();*/
+      /**
+       *@see org.apache.catalina.session.ManagerBase#startInternal() Begin
+       */
+      while (super.sessionCreationTiming.size() < 100) {
+          super.sessionCreationTiming.add(null);
+        }
+        while (super.sessionExpirationTiming.size() < 100) {
+            super.sessionExpirationTiming.add(null);
+        }
+        super.sessionIdGenerator = new SessionIdGenerator();
+        super.sessionIdGenerator.setJvmRoute(getJvmRoute());
+        super.sessionIdGenerator.setSecureRandomAlgorithm(getSecureRandomAlgorithm());
+        super.sessionIdGenerator.setSecureRandomClass(getSecureRandomClass());
+        super.sessionIdGenerator.setSecureRandomProvider(getSecureRandomProvider());
+        super.sessionIdGenerator.setSessionIdLength(getSessionIdLength());
+        if (this.log.isDebugEnabled()) {
+            this.log.debug("Force random number initialization starting");
+        }
+        super.sessionIdGenerator.generateSessionId();
+        if (this.log.isDebugEnabled()) {
+          this.log.debug("Force random number initialization completed");
+        }
+        /**
+         *@see org.apache.catalina.session.ManagerBase#startInternal() End
+         */
     setState(LifecycleState.STARTING);
 
-    Boolean attachedToValve = false;
-    for (Valve valve : getContainer().getPipeline().getValves()) {
-      if (valve instanceof RedisSessionHandlerValve) {
-        this.handlerValve = (RedisSessionHandlerValve) valve;
-        this.handlerValve.setRedisSessionManager(this);
-        log.info("Attached to RedisSessionHandlerValve");
-        attachedToValve = true;
-        break;
-      }
-    }
-
-    if (!attachedToValve) {
-      String error = "Unable to attach to session handling valve; sessions cannot be saved after the request without the valve starting properly.";
-      log.fatal(error);
-      throw new LifecycleException(error);
-    }
-
+    registerMean();
     try {
       initializeSerializer();
     } catch (ClassNotFoundException | InstantiationException | IllegalAccessException e) {
@@ -303,6 +352,14 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     initializeDatabaseConnection();
 
     setDistributable(true);
+    
+    try
+    {
+        restoreAllSessions();
+    } catch (IOException e)
+    {
+        e.printStackTrace();
+    }
   }
 
 
@@ -319,6 +376,15 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
       log.debug("Stopping");
     }
 
+    try
+    {
+        backupAllSessions();
+    } catch (IOException e1)
+    {
+        // TODO Auto-generated catch block
+        e1.printStackTrace();
+    }
+    
     setState(LifecycleState.STOPPING);
 
     try {
@@ -328,127 +394,80 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     }
 
     // Require a new random number generator if we are restarted
-    super.stopInternal();
+    /*super.stopInternal();*/
+    /**
+     *@see org.apache.catalina.session.ManagerBase#stopInternal()
+     */
+    super.sessionIdGenerator = null;
   }
 
-  @Override
-  public Session createSession(String requestedSessionId) {
-    RedisSession session = null;
-    String sessionId = null;
-    String jvmRoute = getJvmRoute();
 
-    Boolean error = true;
-    Jedis jedis = null;
-    try {
-      jedis = acquireConnection();
 
-      // Ensure generation of a unique session identifier.
-      if (null != requestedSessionId) {
-        sessionId = sessionIdWithJvmRoute(requestedSessionId, jvmRoute);
-        if (jedis.setnx(sessionId.getBytes(), NULL_SESSION) == 0L) {
-          sessionId = null;
-        }
-      } else {
-        do {
-          sessionId = sessionIdWithJvmRoute(generateSessionId(), jvmRoute);
-        } while (jedis.setnx(sessionId.getBytes(), NULL_SESSION) == 0L); // 1 = key set; 0 = key already existed
-      }
-
-      /* Even though the key is set in Redis, we are not going to flag
-         the current thread as having had the session persisted since
-         the session isn't actually serialized to Redis yet.
-         This ensures that the save(session) at the end of the request
-         will serialize the session into Redis with 'set' instead of 'setnx'. */
-
-      error = false;
-
-      if (null != sessionId) {
-        session = (RedisSession)createEmptySession();
-        session.setNew(true);
-        session.setValid(true);
-        session.setCreationTime(System.currentTimeMillis());
-        session.setMaxInactiveInterval(getMaxInactiveInterval());
-        session.setId(sessionId);
-        session.tellNew();
-      }
-
-      currentSession.set(session);
-      currentSessionId.set(sessionId);
-      currentSessionIsPersisted.set(false);
-      currentSessionSerializationMetadata.set(new SessionSerializationMetadata());
-
-      if (null != session) {
-        try {
-          error = saveInternal(jedis, session, true);
-        } catch (IOException ex) {
-          log.error("Error saving newly created session: " + ex.getMessage());
-          currentSession.set(null);
-          currentSessionId.set(null);
-          session = null;
-        }
-      }
-    } finally {
-      if (jedis != null) {
-        returnConnection(jedis, error);
-      }
-    }
-
-    return session;
-  }
-
-  private String sessionIdWithJvmRoute(String sessionId, String jvmRoute) {
-    if (jvmRoute != null) {
-      String jvmRoutePrefix = '.' + jvmRoute;
-      return sessionId.endsWith(jvmRoutePrefix) ? sessionId : sessionId + jvmRoutePrefix;
-    }
-    return sessionId;
-  }
-
-  @Override
-  public Session createEmptySession() {
+  private RedisSession createEmptySessionInternal() {
     return new RedisSession(this);
   }
-
-  @Override
-  public void add(Session session) {
-    try {
-      save(session);
-    } catch (IOException ex) {
-      log.warn("Unable to add to session manager store: " + ex.getMessage());
-      throw new RuntimeException("Unable to add to session manager store.", ex);
-    }
-  }
-
-  @Override
-  public Session findSession(String id) throws IOException {
-    RedisSession session = null;
-
-    if (null == id) {
-      currentSessionIsPersisted.set(false);
-      currentSession.set(null);
-      currentSessionSerializationMetadata.set(null);
-      currentSessionId.set(null);
-    } else if (id.equals(currentSessionId.get())) {
-      session = currentSession.get();
-    } else {
-      byte[] data = loadSessionDataFromRedis(id);
-      if (data != null) {
-        DeserializedSessionContainer container = sessionFromSerializedData(id, data);
-        session = container.session;
-        currentSession.set(session);
-        currentSessionSerializationMetadata.set(container.metadata);
-        currentSessionIsPersisted.set(true);
-        currentSessionId.set(id);
-      } else {
-        currentSessionIsPersisted.set(false);
-        currentSession.set(null);
-        currentSessionSerializationMetadata.set(null);
-        currentSessionId.set(null);
+  
+  private RedisSession fromSession(Session session)
+  {
+      final RedisSession redisSession = createEmptySessionInternal();
+      redisSession.setId(session.getId());
+      redisSession.setValid(session.isValid());
+      redisSession.setAuthType(session.getAuthType());
+      redisSession.setCreationTime(session.getCreationTime());
+      redisSession.setMaxInactiveInterval(session.getMaxInactiveInterval());
+      String noteName = null;
+      Iterator<String> nodeNameItr = session.getNoteNames();
+      while(nodeNameItr.hasNext())
+      {
+          noteName =nodeNameItr.next();
+          if(noteName != null)
+          {
+              redisSession.setNote(noteName, session.getNote(noteName));
+          }
       }
-    }
-
-    return session;
+      if(session instanceof StandardSession)
+      {
+          redisSession.setNew(((StandardSession)session).isNew());
+          String attributeName = null;
+          Enumeration<String> attributeNameEnum = ((StandardSession) session).getAttributeNames();
+          while(attributeNameEnum.hasMoreElements())
+          {
+              attributeName = attributeNameEnum.nextElement();
+              redisSession.setAttribute(attributeName, ((StandardSession) session).getAttribute(attributeName));
+          }
+      }
+      return redisSession;
   }
+  
+  private StandardSession toSession(final RedisSession redisSession)
+    {
+        final StandardSession session = new StandardSession(this);
+        session.setId(redisSession.getId());
+        session.setValid(redisSession.isValid());
+        session.setAuthType(redisSession.getAuthType());
+        session.setCreationTime(redisSession.getCreationTime());
+        session.setMaxInactiveInterval(redisSession.getMaxInactiveInterval());
+        String noteName = null;
+        Iterator<String> nodeNameItr = redisSession.getNoteNames();
+        while (nodeNameItr.hasNext())
+        {
+            noteName =nodeNameItr.next();
+            if(noteName != null)
+            {
+                session.setNote(noteName, redisSession.getNote(noteName));
+            }
+        }
+        session.setNew(redisSession.isNew());
+        String attributeName = null;
+        Enumeration<String> attributeNameEnum = redisSession.getAttributeNames();
+        while (attributeNameEnum.hasMoreElements())
+        {
+            attributeName = attributeNameEnum.nextElement();
+            session.setAttribute(attributeName, redisSession.getAttribute(attributeName));
+        }
+        return session;
+    }
+  
 
   public void clear() {
     Jedis jedis = null;
@@ -479,45 +498,8 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     }
   }
 
-  public String[] keys() throws IOException {
-    Jedis jedis = null;
-    Boolean error = true;
-    try {
-      jedis = acquireConnection();
-      Set<String> keySet = jedis.keys("*");
-      error = false;
-      return keySet.toArray(new String[keySet.size()]);
-    } finally {
-      if (jedis != null) {
-        returnConnection(jedis, error);
-      }
-    }
-  }
 
-  public byte[] loadSessionDataFromRedis(String id) throws IOException {
-    Jedis jedis = null;
-    Boolean error = true;
-
-    try {
-      log.trace("Attempting to load session " + id + " from Redis");
-
-      jedis = acquireConnection();
-      byte[] data = jedis.get(id.getBytes());
-      error = false;
-
-      if (data == null) {
-        log.trace("Session " + id + " not found in Redis");
-      }
-
-      return data;
-    } finally {
-      if (jedis != null) {
-        returnConnection(jedis, error);
-      }
-    }
-  }
-
-  public DeserializedSessionContainer sessionFromSerializedData(String id, byte[] data) throws IOException {
+  private DeserializedSessionContainer sessionFromSerializedData(String id, byte[] data) throws IOException {
     log.trace("Deserializing session " + id + " from Redis");
 
     if (Arrays.equals(NULL_SESSION, data)) {
@@ -529,7 +511,7 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     SessionSerializationMetadata metadata = new SessionSerializationMetadata();
 
     try {
-      session = (RedisSession)createEmptySession();
+      session = createEmptySessionInternal();
 
       serializer.deserializeInto(data, session, metadata);
 
@@ -555,11 +537,8 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     return new DeserializedSessionContainer(session, metadata);
   }
 
-  public void save(Session session) throws IOException {
-    save(session, false);
-  }
 
-  public void save(Session session, boolean forceSave) throws IOException {
+  public void save(RedisSession session, boolean forceSave) throws IOException {
     Jedis jedis = null;
     Boolean error = true;
 
@@ -575,13 +554,13 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     }
   }
 
-  protected boolean saveInternal(Jedis jedis, Session session, boolean forceSave) throws IOException {
+  protected boolean saveInternal(Jedis jedis,  RedisSession redisSession, boolean forceSave) throws IOException {
     Boolean error = true;
 
     try {
-      log.trace("Saving session " + session + " into Redis");
+      log.trace("Saving session " + redisSession + " into Redis");
 
-      RedisSession redisSession = (RedisSession)session;
+      //RedisSession redisSession = (RedisSession)session;
 
       if (log.isTraceEnabled()) {
         log.trace("Session Contents [" + redisSession.getId() + "]:");
@@ -593,17 +572,9 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 
       byte[] binaryId = redisSession.getId().getBytes();
 
-      Boolean isCurrentSessionPersisted;
-      SessionSerializationMetadata sessionSerializationMetadata = currentSessionSerializationMetadata.get();
-      byte[] originalSessionAttributesHash = sessionSerializationMetadata.getSessionAttributesHash();
       byte[] sessionAttributesHash = null;
-      if (
-           forceSave
-           || redisSession.isDirty()
-           || null == (isCurrentSessionPersisted = this.currentSessionIsPersisted.get())
-            || !isCurrentSessionPersisted
-           || !Arrays.equals(originalSessionAttributesHash, (sessionAttributesHash = serializer.attributesHashFrom(redisSession)))
-         ) {
+      if (forceSave || redisSession.isDirty()) 
+      {
 
         log.trace("Save was determined to be necessary");
 
@@ -617,8 +588,6 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
         jedis.set(binaryId, serializer.serializeFrom(redisSession, updatedSerializationMetadata));
 
         redisSession.resetDirtyTracking();
-        currentSessionSerializationMetadata.set(updatedSerializationMetadata);
-        currentSessionIsPersisted.set(true);
       } else {
         log.trace("Save was determined to be unnecessary");
       }
@@ -636,58 +605,6 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
     } finally {
       return error;
     }
-  }
-
-  @Override
-  public void remove(Session session) {
-    remove(session, false);
-  }
-
-  @Override
-  public void remove(Session session, boolean update) {
-    Jedis jedis = null;
-    Boolean error = true;
-
-    log.trace("Removing session ID : " + session.getId());
-
-    try {
-      jedis = acquireConnection();
-      jedis.del(session.getId());
-      error = false;
-    } finally {
-      if (jedis != null) {
-        returnConnection(jedis, error);
-      }
-    }
-  }
-
-  public void afterRequest() {
-    RedisSession redisSession = currentSession.get();
-    if (redisSession != null) {
-      try {
-        if (redisSession.isValid()) {
-          log.trace("Request with session completed, saving session " + redisSession.getId());
-          save(redisSession, getAlwaysSaveAfterRequest());
-        } else {
-          log.trace("HTTP Session has been invalidated, removing :" + redisSession.getId());
-          remove(redisSession);
-        }
-      } catch (Exception e) {
-        log.error("Error storing/removing session", e);
-      } finally {
-        currentSession.remove();
-        currentSessionId.remove();
-        currentSessionIsPersisted.remove();
-        log.trace("Session removed from ThreadLocal :" + redisSession.getIdInternal());
-      }
-    }
-  }
-
-  @Override
-  public void processExpires() {
-    // We are going to use Redis's ability to expire keys for session expiration.
-
-    // Do nothing.
   }
 
   private void initializeDatabaseConnection() throws LifecycleException {
