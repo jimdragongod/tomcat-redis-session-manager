@@ -1,3 +1,9 @@
+Example for Config:
+ <Context docBase="helios" path="/helios" reloadable="true" source="org.eclipse.jst.jee.server:helios">
+ 	<Manager pathname="" className="com.orangefunction.tomcat.redissessions.RedisSessionManager" host="127.0.0.1" port="6379" database="0" maxInactiveInterval="1800"/> 
+</Context>
+			
+Contents below are from https://github.com/jcoleman/tomcat-redis-session-manager/blob/master/README.markdown:  
 Redis Session Manager for Apache Tomcat
 =======================================
 
